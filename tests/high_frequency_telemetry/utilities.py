@@ -1318,41 +1318,214 @@ def start_countersyncd_otel(duthost, stats_interval=60):
         "> /tmp/countersyncd_otel.log 2>&1 &"
     )
     duthost.shell(cmd, module_ignore_errors=False)
+    logger.info("Started countersyncd with otel export")
 
 
-def render_otel_collector_yaml_with_ptf_ip(tbinfo, yaml_text):
+def stop_countersyncd_otel(duthost):
     """
-    Replace <PTF_IP> placeholder in otel collector yaml using tbinfo['ptf_ip'].
+    Stop the countersyncd otel process inside swss container.
+    """
+    duthost.shell(
+        "docker exec swss pkill -f 'countersyncd.*--enable-otel' || true",
+        module_ignore_errors=True,
+    )
+    logger.info("Stopped countersyncd otel process")
+
+
+def render_otel_collector_config(template_path, **kwargs):
+    """
+    Render an OpenTelemetry collector config from a Jinja2 template file.
 
     Args:
-        tbinfo: testbed info dict
-        yaml_text: raw yaml string that contains '<PTF_IP>'
+        template_path: local path to the .j2 template file
+        **kwargs: variables to pass to the template (e.g., ptf_ip)
 
     Returns:
-        str: rendered yaml text
+        str: rendered YAML text
     """
-    ptf_ip = tbinfo.get('ptf_ip')
-    if not ptf_ip:
-        pytest_assert(False, "tbinfo['ptf_ip'] is missing")
-    return yaml_text.replace("<PTF_IP>", ptf_ip)
+    from jinja2 import Template
+
+    with open(template_path, "r") as f:
+        template = Template(f.read())
+    return template.render(**kwargs)
 
 
-def install_otel_collector_config(duthost, tbinfo, yaml_text,
-                                  otel_container="otel",
-                                  dest_path="/etc/sonic/otel_config.yml",
-                                  restart=True):
+def install_otel_collector_config(duthost, rendered_config,
+                                  dest_path="/etc/sonic/otel_config.yml"):
     """
-    Render otel collector yaml and install into DUT.
+    Write a rendered otel collector config onto the DUT.
+
+    Args:
+        duthost: DUT host object
+        rendered_config: fully rendered YAML config string
+        dest_path: destination path on DUT
     """
-    rendered = render_otel_collector_yaml_with_ptf_ip(tbinfo, yaml_text)
+    duthost.copy(content=rendered_config, dest=dest_path)
+    logger.info(f"Installed otel collector config to {dest_path}")
 
-    # Write rendered yaml to DUT path
-    duthost.copy(content=rendered, dest=dest_path)
 
-    if restart:
-        duthost.shell(f"docker restart {otel_container}")
-
-    logger.info(
-        f"Installed otel collector config to {dest_path} "
-        f"(ptf_ip={tbinfo.get('ptf_ip')})"
+def enable_otel_collector(duthost, timeout=60):
+    """
+    Enable the OpenTelemetry collector feature on the DUT and wait
+    until the otel container is running.
+    """
+    logger.info("Enabling OpenTelemetry collector...")
+    duthost.shell(
+        "sudo config feature state otel enabled",
+        module_ignore_errors=False,
     )
+
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        # Use -q to return only container IDs; avoids Jinja2 template
+        # conflicts that occur with docker --format "{{.Names}}"
+        result = duthost.shell(
+            'docker ps -q --filter "name=otel"',
+            module_ignore_errors=True,
+        )
+        if result["rc"] == 0 and result["stdout"].strip():
+            logger.info("otel container is running")
+            return True
+        time.sleep(2)
+    pytest_assert(False, "otel container did not become ready in time")
+
+
+def start_influxdb(ptfhost, port=8086, timeout=30):
+    """
+    Start influxd on the PTF host and wait for it to be healthy.
+    Cleans any leftover data from previous runs to ensure a fresh state.
+    """
+    logger.info("Starting InfluxDB on PTF host...")
+
+    # Stop any existing influxd and clean stale data
+    ptfhost.shell("pkill -f influxd || true", module_ignore_errors=True)
+    time.sleep(2)
+    ptfhost.shell("rm -rf ~/.influxdbv2", module_ignore_errors=True)
+
+    ptfhost.shell(
+        f"nohup influxd --http-bind-address=:{port} "
+        "> /tmp/influxd.log 2>&1 &",
+        module_ignore_errors=False,
+    )
+
+    # Wait for health endpoint to return "pass"
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        result = ptfhost.shell(
+            f"curl -sf http://localhost:{port}/health",
+            module_ignore_errors=True,
+        )
+        if result["rc"] == 0 and "pass" in result.get("stdout", ""):
+            logger.info("InfluxDB is healthy")
+            return True
+        time.sleep(2)
+    pytest_assert(False, f"InfluxDB did not become healthy within {timeout}s")
+
+
+def setup_influxdb(ptfhost, port=8086, org="docs", bucket="home",
+                   token="mytoken123456789", username="admin",
+                   password="password123"):
+    """
+    Initialize InfluxDB 2.x via the onboarding setup API.
+    Idempotent: skips if already set up.
+    """
+    import json
+
+    setup_payload = json.dumps({
+        "username": username,
+        "password": password,
+        "org": org,
+        "bucket": bucket,
+        "token": token,
+    })
+
+    result = ptfhost.shell(
+        f"curl -sf -X POST http://localhost:{port}/api/v2/setup "
+        f"-H 'Content-Type: application/json' "
+        f"--data '{setup_payload}'",
+        module_ignore_errors=True,
+    )
+    if result["rc"] != 0:
+        # Check if already set up (allowed=false means setup was done before)
+        check = ptfhost.shell(
+            f"curl -sf http://localhost:{port}/api/v2/setup",
+            module_ignore_errors=True,
+        )
+        if '"allowed":false' in check.get("stdout", ""):
+            logger.info("InfluxDB already set up, skipping")
+            return
+        pytest_assert(
+            False,
+            f"InfluxDB setup failed: {result.get('stderr', '')}",
+        )
+    logger.info(f"InfluxDB setup complete (org={org}, bucket={bucket})")
+
+
+def query_influxdb(ptfhost, flux_query, port=8086, org="docs",
+                   token="mytoken123456789"):
+    """
+    Execute a Flux query against InfluxDB via the HTTP API.
+
+    Returns:
+        dict: shell result with 'rc', 'stdout', 'stderr'
+    """
+    cmd = (
+        f"curl -sS -X POST 'http://localhost:{port}/api/v2/query?org={org}' "
+        f"-H 'Authorization: Token {token}' "
+        f"-H 'Content-Type: application/vnd.flux' "
+        f"-H 'Accept: application/csv' "
+        f"--data-binary '{flux_query}'"
+    )
+    return ptfhost.shell(cmd, module_ignore_errors=True)
+
+
+def wait_for_influxdb_data(ptfhost, bucket="home", org="docs",
+                           token="mytoken123456789", port=8086,
+                           timeout=60, poll_interval=5):
+    """
+    Poll InfluxDB until at least one data point appears in the bucket.
+
+    Returns:
+        dict or None: the query result if data is found, None on timeout
+    """
+    flux_query = f'from(bucket:"{bucket}") |> range(start:-10m) |> limit(n:5)'
+
+    end_time = time.time() + timeout
+    last_result = None
+    while time.time() < end_time:
+        last_result = query_influxdb(
+            ptfhost, flux_query, port=port, org=org, token=token,
+        )
+        stdout = last_result.get("stdout", "").strip()
+        if last_result["rc"] == 0 and stdout:
+            # InfluxDB CSV: lines starting with '#' are annotations,
+            # the first non-annotation line is the header, subsequent
+            # non-empty lines are data rows.
+            data_lines = [
+                line for line in stdout.split("\n")
+                if line.strip()
+                and not line.startswith("#")
+                and not line.startswith(",result,")
+            ]
+            if data_lines:
+                logger.info(
+                    f"InfluxDB returned {len(data_lines)} data row(s)"
+                )
+                return last_result
+        time.sleep(poll_interval)
+
+    logger.warning(
+        "Timed out waiting for InfluxDB data. "
+        f"Last response: {last_result}"
+    )
+    return None
+
+
+def stop_influxdb(ptfhost):
+    """
+    Stop influxd on the PTF host and clean up data.
+    """
+    ptfhost.shell("pkill -f influxd || true", module_ignore_errors=True)
+    time.sleep(2)
+    ptfhost.shell("rm -rf ~/.influxdbv2", module_ignore_errors=True)
+    logger.info("InfluxDB stopped and data cleaned on PTF host")

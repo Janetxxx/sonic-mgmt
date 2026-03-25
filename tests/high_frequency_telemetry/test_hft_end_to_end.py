@@ -10,7 +10,14 @@ from tests.high_frequency_telemetry.utilities import (
     cleanup_hft_config,
     get_available_ports,
     start_countersyncd_otel,
+    stop_countersyncd_otel,
+    render_otel_collector_config,
     install_otel_collector_config,
+    enable_otel_collector,
+    start_influxdb,
+    setup_influxdb,
+    wait_for_influxdb_data,
+    stop_influxdb,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,92 +26,104 @@ pytestmark = [
     pytest.mark.topology('any')
 ]
 
-def enable_otel_collector(duthost, timeout=60):
-    """
-    Enable the OpenTelemetry collector on the DUT and wait until the otel container is running.
-    """
-    logger.info("Enabling OpenTelemetry collector...")
-    duthost.shell("sudo config feature state otel enabled", module_ignore_errors=False)
-
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        result = duthost.shell(
-            'docker ps --format "{{.Names}}" | grep -w otel',
-            module_ignore_errors=True
-        )
-        if result["rc"] == 0 and result["stdout"].strip() == "otel":
-            return True
-        time.sleep(2)
-    pytest_assert(False, "otel container did not become ready in time")
+# InfluxDB constants shared between otel collector config and query helpers
+INFLUXDB_PORT = 8086
+INFLUXDB_ORG = "docs"
+INFLUXDB_BUCKET = "home"
+INFLUXDB_TOKEN = "mytoken123456789"
 
 
-def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname, disable_flex_counters, tbinfo, ptfhost):
+def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
+                                 disable_flex_counters, tbinfo, ptfhost):
     """
-    Test end-to-end high frequency telemetry with OpenTelemetry collector exporting to InfluxDB.
+    End-to-end test for High Frequency Telemetry.
+
+    Flow:
+      1. Start InfluxDB on PTF and initialise org / bucket / token
+      2. Enable the otel container on the DUT
+      3. Install the otel-collector config that exports to PTF's InfluxDB
+      4. Configure an HFT profile + port group
+      5. Start countersyncd with --enable-otel
+      6. Poll InfluxDB until metrics arrive (or timeout)
     """
     duthost = duthosts[enum_rand_one_per_hwsku_hostname]
 
     profile_name = "port_profile"
     group_name = "PORT"
 
-    # Install and enable OpenTelemetry collector with InfluxDB configuration
-    yaml_path = os.path.join(os.path.dirname(__file__), "otel_collector_influxdb.yaml")
-    with open(yaml_path, "r") as f:
-        yaml_text = f.read()
-    install_otel_collector_config(duthost, tbinfo, yaml_text, restart=True)
-    enable_otel_collector(duthost)
-
-    # Get available ports from topology (try for 2 ports, min 1 required)
-    test_ports = get_available_ports(duthost, tbinfo, desired_ports=2,
-                                     min_ports=1)
-
-    logger.info(f"Using ports for testing: {test_ports}")
-
     try:
-        # Step 1: Set up high frequency telemetry profile
+        # --- Step 1: Start and set up InfluxDB on PTF ---
+        start_influxdb(ptfhost, port=INFLUXDB_PORT)
+        setup_influxdb(
+            ptfhost,
+            port=INFLUXDB_PORT,
+            org=INFLUXDB_ORG,
+            bucket=INFLUXDB_BUCKET,
+            token=INFLUXDB_TOKEN,
+        )
+
+        # --- Step 2: Enable the otel feature (creates the container) ---
+        enable_otel_collector(duthost)
+
+        # --- Step 3: Render and install otel collector config, then restart ---
+        template_path = os.path.join(
+            os.path.dirname(__file__), "otel_collector_influxdb.yaml.j2"
+        )
+        rendered_config = render_otel_collector_config(
+            template_path,
+            ptf_ip=tbinfo["ptf_ip"],
+            influxdb_org=INFLUXDB_ORG,
+            influxdb_bucket=INFLUXDB_BUCKET,
+            influxdb_token=INFLUXDB_TOKEN,
+        )
+        install_otel_collector_config(duthost, rendered_config)
+        duthost.shell("docker restart otel", module_ignore_errors=False)
+        time.sleep(5)
+
+        # --- Step 4: Discover ports and configure HFT ---
+        test_ports = get_available_ports(
+            duthost, tbinfo, desired_ports=2, min_ports=1
+        )
+        logger.info(f"Using ports for testing: {test_ports}")
+
         setup_hft_profile(
             duthost=duthost,
             profile_name=profile_name,
             poll_interval=10000,
-            stream_state="enabled"  # Changed from "disabled" to "enabled"
+            stream_state="enabled",
         )
 
-        # Step 2: Configure port group with specific ports and counters
         setup_hft_group(
             duthost=duthost,
             profile_name=profile_name,
             group_name=group_name,
             object_names=test_ports,
-            object_counters=["IF_IN_OCTETS"]
+            object_counters=["IF_IN_OCTETS"],
         )
-
         logger.info("High frequency telemetry configuration completed")
 
-        # Step 3: Start countersyncd and export to OpenTelemetry collector
+        # --- Step 5: Start countersyncd with otel export ---
         start_countersyncd_otel(duthost, stats_interval=60)
-        time.sleep(20)
 
-        # Step 4: Query InfluxDB on PTF to confirm metrics arrived
-        flux_query = (
-            'from(bucket:"home")'
-            ' |> range(start:-10m)'
-            ' |> filter(fn: (r) => r["_measurement"] =~ /telemetry|hft|counter/i)'
-            ' |> limit(n:1)'
+        # --- Step 6: Wait for metrics to arrive in InfluxDB ---
+        result = wait_for_influxdb_data(
+            ptfhost,
+            bucket=INFLUXDB_BUCKET,
+            org=INFLUXDB_ORG,
+            token=INFLUXDB_TOKEN,
+            port=INFLUXDB_PORT,
+            timeout=60,
         )
-
-        influx_cmd = (
-            'docker exec -i influxdb '
-            'influx query '
-            '--org docs '
-            '--token mytoken123456789 '
-            f'--raw "{flux_query}"'
-        )
-
-        result = ptfhost.shell(influx_cmd, module_ignore_errors=True)
         pytest_assert(
-            result["rc"] == 0 and result.get("stdout", "").strip(),
-            "No metrics found in InfluxDB (query returned empty)"
+            result is not None,
+            "No metrics found in InfluxDB after waiting 60 seconds",
+        )
+        logger.info(
+            "InfluxDB query returned data:\n"
+            f"{result.get('stdout', '')[:500]}"
         )
 
     finally:
         cleanup_hft_config(duthost, profile_name)
+        stop_countersyncd_otel(duthost)
+        stop_influxdb(ptfhost)

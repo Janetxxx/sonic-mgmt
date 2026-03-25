@@ -8,10 +8,10 @@ receivers:
 
 exporters:
   influxdb:
-    endpoint: http://<PTF_IP>:8086
-    org: docs
-    bucket: home
-    token: mytoken123456789
+    endpoint: http://{{ ptf_ip }}:8086
+    org: {{ influxdb_org }}
+    bucket: {{ influxdb_bucket }}
+    token: {{ influxdb_token }}
     timeout: 10s
   debug:
     verbosity: detailed
