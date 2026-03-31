@@ -179,6 +179,7 @@ def rotate_telemetry_certs(duthost, localhost):
               -x509 \
               -sha256 \
               -nodes \
+              -days 365 \
               -newkey rsa:2048 \
               -keyout streamingtelemetryserver.key \
               -subj '/CN=ndastreamingservertest' \
@@ -188,6 +189,7 @@ def rotate_telemetry_certs(duthost, localhost):
               -x509 \
               -sha256 \
               -nodes \
+              -days 365 \
               -newkey rsa:2048 \
               -keyout dsmsroot.key \
               -subj '/CN=ndastreamingclienttest' \
@@ -204,3 +206,9 @@ def rotate_telemetry_certs(duthost, localhost):
 def execute_ptf_gnmi_cli(ptfhost, cmd):
     rc = ptfhost.shell(cmd)['rc']
     return rc == 0
+
+
+def invoke_py_cli_from_ptf(ptfhost, cmd, callback):
+    ret = ptfhost.shell(cmd)
+    assert ret["rc"] == 0, "PTF docker did not get a response"
+    callback(ret["stdout"])
