@@ -411,4 +411,3 @@ Pipeline:   metrics → [otlp] → [batch] → [debug, influxdb]
 | Arista 7060X6 support | Platform is listed in conditional marks but has empty counter definitions — HFT tests not yet functional. |
 | Buffer pool counters on SN5640 | Currently empty in `counter_profiles.py` — `test_hft_full_buffer_pool_counters` will skip on this platform. |
 | OpenTelemetry integration | `setup_hft_profile()` accepts `otel_endpoint`/`otel_certs` parameters but they are not yet supported by the `config hft` CLI. |
-| E2E test dependency | `test_hft_end_to_end_influxdb` requires `influxd` in the PTF container ([sonic-buildimage PR #26146](https://github.com/sonic-net/sonic-buildimage/pull/26146)) and otel container support on the DUT. |
