@@ -22,6 +22,8 @@
     - [Test HFT Config Deletion Stream](#test-case-test-hft-config-deletion-stream)
     - [Test HFT Poll Interval Validation](#test-case-test-hft-poll-interval-validation)
     - [Test HFT Port Shutdown Stream](#test-case-test-hft-port-shutdown-stream)
+  - [End-to-End Tests](#end-to-end-tests)
+    - [Test HFT End-to-End InfluxDB](#test-case-test-hft-end-to-end-influxdb)
 - [Open/Action Items](#openaction-items)
 
 ---
@@ -123,6 +125,16 @@ Key utility functions in `tests/high_frequency_telemetry/utilities.py`:
 | `validate_config_state_transitions(...)` | Validates Msg/s behavior across create/delete/recreate phases. |
 | `validate_port_state_transitions(...)` | Validates counter trend (increasing/stable) across port up/down phases. |
 | `analyze_counter_trend(output)` | Determines counter trend from sampled values: `increasing`, `stable`, `decreasing`, or `no_pattern`. |
+| `start_countersyncd_otel(duthost, stats_interval)` | Starts `countersyncd --enable-otel` in background inside the `swss` container for OpenTelemetry export. |
+| `stop_countersyncd_otel(duthost)` | Stops the otel-enabled `countersyncd` process inside `swss`. |
+| `render_otel_collector_config(template_path, **kwargs)` | Renders an OpenTelemetry collector YAML config from a Jinja2 template (e.g., `otel_collector_influxdb.yaml.j2`). |
+| `install_otel_collector_config(duthost, rendered_config)` | Writes the rendered otel collector config to `/etc/sonic/otel_config.yml` on the DUT. |
+| `enable_otel_collector(duthost, timeout)` | Enables the `otel` feature via `config feature state otel enabled` and waits for the container to be running. |
+| `start_influxdb(ptfhost, port)` | Starts `influxd` on the PTF host, cleans stale data, and waits for the health endpoint to return `pass`. |
+| `setup_influxdb(ptfhost, port, org, bucket, token)` | Initializes InfluxDB 2.x via the onboarding `/api/v2/setup` API. Idempotent. |
+| `query_influxdb(ptfhost, flux_query, port, org, token)` | Executes a Flux query against InfluxDB via the HTTP API and returns the result. |
+| `wait_for_influxdb_data(ptfhost, bucket, org, token, port, timeout)` | Polls InfluxDB until at least one data point appears in the bucket, or times out. |
+| `stop_influxdb(ptfhost)` | Stops `influxd` on the PTF host and cleans up data. |
 
 ---
 
@@ -399,6 +411,45 @@ All test cases are in `tests/high_frequency_telemetry/test_high_frequency_teleme
 
 ---
 
+### End-to-End Tests
+
+#### Test Case: Test HFT End-to-End InfluxDB
+
+| Item | Description |
+|---|---|
+| **Test Name** | `test_hft_end_to_end_influxdb` |
+| **Test File** | `tests/high_frequency_telemetry/test_hft_end_to_end.py` |
+| **Objective** | Validate the full HFT telemetry pipeline end-to-end: `countersyncd` → OpenTelemetry collector → InfluxDB. Confirms that HFT metrics actually flow through the otel collector and arrive in an external time-series database. |
+| **Fixtures** | `disable_flex_counters`, `tbinfo`, `ptfhost` |
+| **Topology** | `any` |
+| **Dependencies** | Requires `influxd` binary installed in PTF container ([sonic-buildimage PR #26146](https://github.com/sonic-net/sonic-buildimage/pull/26146)). Requires `otel` container support on DUT. |
+
+**Test Steps**
+1. **Start InfluxDB on PTF host**: Kill any existing `influxd`, clean stale data (`~/.influxdbv2`), start `influxd` on port 8086, and wait for the `/health` endpoint to return `pass` (30s timeout).
+2. **Initialize InfluxDB**: Call the `/api/v2/setup` onboarding API to create org (`docs`), bucket (`home`), and token (`mytoken123456789`). Idempotent — skips if already set up.
+3. **Enable otel collector on DUT**: Run `config feature state otel enabled` and wait up to 60 seconds for the `otel` container to be running.
+4. **Install otel collector config**: Render the Jinja2 template (`otel_collector_influxdb.yaml.j2`) with PTF IP, InfluxDB org/bucket/token, and copy to `/etc/sonic/otel_config.yml` on the DUT. Restart the `otel` container.
+5. **Configure HFT**: Get available ports (desired: 2, minimum: 1). Create HFT profile (`port_profile`, poll interval 10ms, stream `enabled`) and PORT group monitoring `IF_IN_OCTETS`.
+6. **Start countersyncd with otel export**: Run `countersyncd --enable-otel -e` in background inside `swss` container.
+7. **Poll InfluxDB for metrics**: Execute Flux query `from(bucket:"home") |> range(start:-10m) |> limit(n:5)` every 5 seconds for up to 60 seconds. Parse CSV response — skip annotation lines (starting with `#`) and header lines.
+8. **Verify data arrived**: Assert that at least one data row is returned from InfluxDB.
+9. **Cleanup**: Remove HFT config, stop `countersyncd` otel process, stop `influxd` and clean data on PTF host.
+
+**Otel Collector Config** (`otel_collector_influxdb.yaml.j2`)
+```
+Receivers:  otlp (gRPC :4317, HTTP :4318)
+Processors: batch (timeout 1s, batch size 10)
+Exporters:  influxdb (PTF host :8086) + debug (verbose)
+Pipeline:   metrics → [otlp] → [batch] → [debug, influxdb]
+```
+
+**Expected Results**
+- InfluxDB health endpoint returns `pass` after startup.
+- Otel container starts successfully on DUT.
+- InfluxDB query returns ≥ 1 data row within 60 seconds, confirming metrics flowed through the full pipeline.
+
+---
+
 ## Open/Action Items
 
 | Item | Notes |
@@ -408,3 +459,4 @@ All test cases are in `tests/high_frequency_telemetry/test_high_frequency_teleme
 | Arista 7060X6 support | Platform is listed in conditional marks but has empty counter definitions — HFT tests not yet functional. |
 | Buffer pool counters on SN5640 | Currently empty in `counter_profiles.py` — `test_hft_full_buffer_pool_counters` will skip on this platform. |
 | OpenTelemetry integration | `setup_hft_profile()` accepts `otel_endpoint`/`otel_certs` parameters but they are not yet supported by the `config hft` CLI. |
+| E2E test dependency | `test_hft_end_to_end_influxdb` requires `influxd` in the PTF container ([sonic-buildimage PR #26146](https://github.com/sonic-net/sonic-buildimage/pull/26146)) and otel container support on the DUT. |
