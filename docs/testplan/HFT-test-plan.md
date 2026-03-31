@@ -7,8 +7,6 @@
 - [Setup Configuration](#setup-configuration)
   - [Prerequisites](#prerequisites)
   - [Platform Support](#platform-support)
-  - [Test Fixtures](#test-fixtures)
-  - [Test Utilities](#test-utilities)
 - [Test Cases](#test-cases)
   - [Basic Functionality Tests](#basic-functionality-tests)
     - [Test HFT Port Counters](#test-case-test-hft-port-counters)
@@ -90,57 +88,11 @@ HFT tests are conditionally skipped via `tests_mark_conditions.yaml` on unsuppor
 | `x86_64-arista_7060x6_64pe_b` | Supported (limited) |
 | All other platforms | Skipped |
 
-Per-platform supported counters are defined in `tests/high_frequency_telemetry/counter_profiles.py`. Tests call `get_support_counter_list(duthost, counter_type)` to get the counters available on the current DUT and skip if none are returned.
-
-### Test Fixtures
-
-All fixtures are defined in `tests/high_frequency_telemetry/conftest.py` and run at function scope:
-
-| Fixture | Purpose |
-|---|---|
-| `ensure_swss_ready` | Verifies the `swss` container is running with ≥ 10s uptime. Restarts `swss` via `systemctl restart swss` if needed and waits up to 40s for stabilization. |
-| `cleanup_high_frequency_telemetry` | Removes stale `HIGH_FREQUENCY_TELEMETRY_PROFILE` and `HIGH_FREQUENCY_TELEMETRY_GROUP` keys from CONFIG_DB before each test. Depends on `ensure_swss_ready`. |
-| `disable_flex_counters` | Disables all `FLEX_COUNTER_TABLE` entries in CONFIG_DB to prevent interference with HFT counter polling. Restores original states after each test. Depends on `cleanup_high_frequency_telemetry`. |
-
-Fixture dependency chain: `ensure_swss_ready` → `cleanup_high_frequency_telemetry` → `disable_flex_counters`
-
-### Test Utilities
-
-Key utility functions in `tests/high_frequency_telemetry/utilities.py`:
-
-| Function | Purpose |
-|---|---|
-| `get_available_ports(duthost, tbinfo, desired_ports, min_ports)` | Returns admin-up ports from topology, excluding port-channel members. Skips test if fewer than `min_ports` available. |
-| `get_configured_queue_objects(duthost)` | Returns queue objects from `COUNTERS_QUEUE_NAME_MAP` in COUNTERS_DB as `port\|queue_id` strings. |
-| `get_configured_buffer_queue_objects(duthost)` | Returns buffer queue objects from `COUNTERS_PG_NAME_MAP` in COUNTERS_DB. |
-| `get_configured_buffer_pools(duthost)` | Returns buffer pool names from CONFIG_DB `BUFFER_POOL` table. |
-| `setup_hft_profile(...)` | Creates an HFT profile via `config hft add profile` with poll interval and stream state. |
-| `setup_hft_group(...)` | Creates an HFT group via `config hft add group` with object type, names, and counters. |
-| `setup_hft_stream_state(...)` | Enables/disables an HFT stream via `config hft enable/disable`. |
-| `cleanup_hft_config(...)` | Removes HFT groups and profile via `config hft del group/profile`. |
-| `run_countersyncd_and_capture_output(...)` | Runs `countersyncd -e` inside `swss` container with timeout and captures output. |
-| `CountersyncdMonitor` | Background monitor class that runs `countersyncd` with file-based output capture for continuous state transition tests. |
-| `validate_counter_output(...)` | Validates countersyncd output: parses `[Report #N]` blocks, checks counter values, Msg/s rates, `LastTime` timestamps, and per-object counters. |
-| `validate_stream_state_transitions(...)` | Validates Msg/s behavior across enabled/disabled phases. |
-| `validate_config_state_transitions(...)` | Validates Msg/s behavior across create/delete/recreate phases. |
-| `validate_port_state_transitions(...)` | Validates counter trend (increasing/stable) across port up/down phases. |
-| `analyze_counter_trend(output)` | Determines counter trend from sampled values: `increasing`, `stable`, `decreasing`, or `no_pattern`. |
-| `start_countersyncd_otel(duthost, stats_interval)` | Starts `countersyncd --enable-otel` in background inside the `swss` container for OpenTelemetry export. |
-| `stop_countersyncd_otel(duthost)` | Stops the otel-enabled `countersyncd` process inside `swss`. |
-| `render_otel_collector_config(template_path, **kwargs)` | Renders an OpenTelemetry collector YAML config from a Jinja2 template (e.g., `otel_collector_influxdb.yaml.j2`). |
-| `install_otel_collector_config(duthost, rendered_config)` | Writes the rendered otel collector config to `/etc/sonic/otel_config.yml` on the DUT. |
-| `enable_otel_collector(duthost, timeout)` | Enables the `otel` feature via `config feature state otel enabled` and waits for the container to be running. |
-| `start_influxdb(ptfhost, port)` | Starts `influxd` on the PTF host, cleans stale data, and waits for the health endpoint to return `pass`. |
-| `setup_influxdb(ptfhost, port, org, bucket, token)` | Initializes InfluxDB 2.x via the onboarding `/api/v2/setup` API. Idempotent. |
-| `query_influxdb(ptfhost, flux_query, port, org, token)` | Executes a Flux query against InfluxDB via the HTTP API and returns the result. |
-| `wait_for_influxdb_data(ptfhost, bucket, org, token, port, timeout)` | Polls InfluxDB until at least one data point appears in the bucket, or times out. |
-| `stop_influxdb(ptfhost)` | Stops `influxd` on the PTF host and cleans up data. |
+Per-platform supported counters are defined in `tests/high_frequency_telemetry/counter_profiles.py`. Tests dynamically query supported counters and skip if none are available.
 
 ---
 
 ## Test Cases
-
-All test cases are in `tests/high_frequency_telemetry/test_high_frequency_telemetry.py`.
 
 ### Basic Functionality Tests
 
