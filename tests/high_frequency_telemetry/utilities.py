@@ -1532,17 +1532,53 @@ def enable_otel_collector(duthost, timeout=60):
     """
     Enable the OpenTelemetry collector feature on the DUT and wait
     until the otel container is running.
+
+    If the feature entry is missing from CONFIG_DB (e.g. after a
+    config_reload) but the docker image exists, re-add the entry.
+    Skips the test if the platform does not support otel at all.
     """
     logger.info("Enabling OpenTelemetry collector...")
-    duthost.shell(
-        "sudo config feature state otel enabled",
-        module_ignore_errors=False,
+
+    # Check if the otel docker image exists (platform support check).
+    # Retry a few times because docker daemon may still be restarting
+    # after a config_reload triggered by test fixtures.
+    has_image = False
+    for attempt in range(6):
+        img_check = duthost.shell(
+            "docker images docker-sonic-otel --format yes",
+            module_ignore_errors=True,
+        )
+        if img_check["rc"] == 0 and "yes" in img_check.get("stdout", ""):
+            has_image = True
+            break
+        logger.info("docker image check attempt %d failed, retrying in 10s...",
+                    attempt + 1)
+        time.sleep(10)
+    if not has_image:
+        pytest.skip("otel is not supported on this platform "
+                    "(docker-sonic-otel image not found)")
+
+    # Ensure the feature entry exists in CONFIG_DB
+    check = duthost.shell(
+        "sonic-db-cli CONFIG_DB exists 'FEATURE|otel'",
+        module_ignore_errors=True,
     )
+    if check.get("stdout", "").strip() == "0":
+        logger.info("otel feature entry missing from CONFIG_DB, re-adding...")
+        duthost.shell(
+            "sonic-db-cli CONFIG_DB hmset 'FEATURE|otel' "
+            "state enabled auto_restart enabled "
+            "has_global_scope True has_per_asic_scope False",
+            module_ignore_errors=False,
+        )
+    else:
+        duthost.shell(
+            "sudo config feature state otel enabled",
+            module_ignore_errors=False,
+        )
 
     end_time = time.time() + timeout
     while time.time() < end_time:
-        # Use -q to return only container IDs; avoids Jinja2 template
-        # conflicts that occur with docker --format "{{.Names}}"
         result = duthost.shell(
             'docker ps -q --filter "name=otel"',
             module_ignore_errors=True,
@@ -1693,3 +1729,174 @@ def stop_influxdb(ptfhost):
     time.sleep(2)
     ptfhost.shell("rm -rf ~/.influxdbv2", module_ignore_errors=True)
     logger.info("InfluxDB stopped and data cleaned on PTF host")
+
+
+def parse_influxdb_csv(csv_text):
+    """
+    Parse InfluxDB annotated CSV into a list of dicts grouped by series.
+
+    InfluxDB CSV has annotation lines starting with '#', a header line,
+    and data rows. The 'table' column identifies the series group.
+
+    Returns:
+        dict: mapping of series_key -> list of data-row dicts.
+              series_key is built from _measurement + _field + tag columns.
+    """
+    import csv
+    import io
+
+    lines = [
+        line for line in csv_text.strip().split("\n")
+        if line.strip() and not line.startswith("#")
+    ]
+    if not lines:
+        return {}
+
+    reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    groups = {}
+    for row in reader:
+        # Build a series key from measurement, field, and any tag-like columns
+        measurement = row.get("_measurement", "")
+        field = row.get("_field", "")
+        # Use table column as the primary grouping key
+        table = row.get("table", "0")
+        series_key = f"{measurement}/{field}/table={table}"
+        groups.setdefault(series_key, []).append(row)
+    return groups
+
+
+def validate_influxdb_intervals(ptfhost, bucket="home", org="docs",
+                                token="mytoken123456789", port=8086,
+                                expected_interval_ms=10,
+                                tolerance_low=0.5, tolerance_high=1.5,
+                                avg_tolerance=0.2, min_points=10):
+    """
+    Validate that HFT data points in InfluxDB arrive at the expected interval.
+
+    Queries all data from the last 5 minutes, groups by series, and for each
+    group checks that:
+      1. Consecutive timestamp deltas fall within
+         [expected_ms * tolerance_low, expected_ms * tolerance_high]
+      2. The average delta is within avg_tolerance of expected_ms
+
+    Args:
+        ptfhost: PTF host object
+        bucket: InfluxDB bucket name
+        org: InfluxDB org name
+        token: InfluxDB auth token
+        port: InfluxDB HTTP port
+        expected_interval_ms: expected interval between points in ms
+        tolerance_low: lower multiplier (0.5 = 50% of expected)
+        tolerance_high: upper multiplier (1.5 = 150% of expected)
+        avg_tolerance: allowed deviation ratio for average (0.2 = 20%)
+        min_points: minimum data points per group to validate
+
+    Returns:
+        dict with keys:
+          - 'groups': dict of series_key -> stats dict
+          - 'violations': list of violation descriptions
+          - 'passed': bool
+    """
+    from datetime import datetime
+
+    flux_query = (
+        f'from(bucket:"{bucket}") '
+        f'|> range(start:-5m) '
+        f'|> filter(fn: (r) => r._field == "IF_IN_OCTETS") '
+        f'|> group(columns: ["_measurement", "_field", "object_id"]) '
+        f'|> sort(columns: ["_time"])'
+    )
+    result = query_influxdb(ptfhost, flux_query, port=port, org=org,
+                            token=token)
+    if result["rc"] != 0 or not result.get("stdout", "").strip():
+        return {"groups": {}, "violations": ["No data returned from query"],
+                "passed": False}
+
+    groups = parse_influxdb_csv(result["stdout"])
+    all_stats = {}
+    violations = []
+
+    min_ms = expected_interval_ms * tolerance_low
+    max_ms = expected_interval_ms * tolerance_high
+
+    for series_key, rows in groups.items():
+        timestamps = []
+        for row in rows:
+            time_str = row.get("_time", "")
+            if not time_str:
+                continue
+            try:
+                # InfluxDB returns RFC3339 with nanoseconds, e.g.
+                # 2026-04-10T06:32:03.117415123Z
+                # Python's fromisoformat handles up to microseconds
+                clean = time_str.replace("Z", "+00:00")
+                # Truncate to microseconds if nanoseconds present
+                if "." in clean:
+                    dot_idx = clean.index(".")
+                    plus_idx = clean.index("+", dot_idx)
+                    frac = clean[dot_idx + 1:plus_idx]
+                    frac = frac[:6]  # truncate to microseconds
+                    clean = clean[:dot_idx + 1] + frac + clean[plus_idx:]
+                ts = datetime.fromisoformat(clean)
+                timestamps.append(ts)
+            except (ValueError, IndexError):
+                continue
+
+        if len(timestamps) < min_points:
+            logger.info("Series %s has only %d points, skipping validation",
+                        series_key, len(timestamps))
+            continue
+
+        timestamps.sort()
+        deltas_ms = []
+        for i in range(1, len(timestamps)):
+            delta = (timestamps[i] - timestamps[i - 1]).total_seconds() * 1000
+            deltas_ms.append(delta)
+
+        out_of_range = [
+            (i, d) for i, d in enumerate(deltas_ms)
+            if d < min_ms or d > max_ms
+        ]
+        avg_delta = sum(deltas_ms) / len(deltas_ms) if deltas_ms else 0
+        min_delta = min(deltas_ms) if deltas_ms else 0
+        max_delta = max(deltas_ms) if deltas_ms else 0
+
+        stats = {
+            "num_points": len(timestamps),
+            "num_intervals": len(deltas_ms),
+            "avg_ms": round(avg_delta, 3),
+            "min_ms": round(min_delta, 3),
+            "max_ms": round(max_delta, 3),
+            "out_of_range_count": len(out_of_range),
+        }
+        all_stats[series_key] = stats
+
+        logger.info(
+            "Series %s: %d points, avg=%.3fms, min=%.3fms, max=%.3fms, "
+            "out_of_range=%d",
+            series_key, len(timestamps), avg_delta, min_delta, max_delta,
+            len(out_of_range),
+        )
+
+        # Check individual intervals
+        if out_of_range:
+            pct = len(out_of_range) / len(deltas_ms) * 100
+            violations.append(
+                f"{series_key}: {len(out_of_range)}/{len(deltas_ms)} "
+                f"intervals ({pct:.1f}%) outside [{min_ms}, {max_ms}]ms"
+            )
+
+        # Check average interval
+        if abs(avg_delta - expected_interval_ms) > \
+                expected_interval_ms * avg_tolerance:
+            violations.append(
+                f"{series_key}: avg interval {avg_delta:.3f}ms deviates "
+                f"more than {avg_tolerance * 100}% from expected "
+                f"{expected_interval_ms}ms"
+            )
+
+    return {
+        "groups": all_stats,
+        "violations": violations,
+        "passed": len(violations) == 0,
+    }

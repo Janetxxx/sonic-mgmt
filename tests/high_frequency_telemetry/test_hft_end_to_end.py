@@ -18,6 +18,7 @@ from tests.high_frequency_telemetry.utilities import (
     setup_influxdb,
     wait_for_influxdb_data,
     stop_influxdb,
+    validate_influxdb_intervals,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,40 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
             "InfluxDB query returned data:\n"
             f"{result.get('stdout', '')[:500]}"
         )
+
+        # --- Step 7: Accumulate data and validate polling intervals ---
+        logger.info("Waiting 30s to accumulate more data points...")
+        time.sleep(30)
+
+        interval_result = validate_influxdb_intervals(
+            ptfhost,
+            bucket=INFLUXDB_BUCKET,
+            org=INFLUXDB_ORG,
+            token=INFLUXDB_TOKEN,
+            port=INFLUXDB_PORT,
+            expected_interval_ms=10,
+            tolerance_low=0.5,
+            tolerance_high=1.5,
+            avg_tolerance=0.2,
+            min_points=10,
+        )
+        for series, stats in interval_result["groups"].items():
+            logger.info(
+                "Interval stats for %s: points=%d avg=%.3fms "
+                "min=%.3fms max=%.3fms out_of_range=%d",
+                series, stats["num_points"], stats["avg_ms"],
+                stats["min_ms"], stats["max_ms"],
+                stats["out_of_range_count"],
+            )
+        if interval_result["violations"]:
+            for v in interval_result["violations"]:
+                logger.warning("Interval violation: %s", v)
+        pytest_assert(
+            interval_result["passed"],
+            "HFT polling interval validation failed: "
+            + "; ".join(interval_result["violations"]),
+        )
+        logger.info("HFT polling interval validation passed")
 
     finally:
         cleanup_hft_config(duthost, profile_name)
