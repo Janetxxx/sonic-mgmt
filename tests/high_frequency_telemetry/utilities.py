@@ -1590,128 +1590,111 @@ def enable_otel_collector(duthost, timeout=60):
     pytest_assert(False, "otel container did not become ready in time")
 
 
-def start_influxdb(ptfhost, port=8086, timeout=30):
+def start_influxdb(ptfhost, port=8181, timeout=30):
     """
-    Start influxd on the PTF host and wait for it to be healthy.
+    Start InfluxDB 3 Core on the PTF host and wait for it to be healthy.
     Cleans any leftover data from previous runs to ensure a fresh state.
     """
-    logger.info("Starting InfluxDB on PTF host...")
+    logger.info("Starting InfluxDB 3 on PTF host...")
 
-    # Stop any existing influxd and clean stale data
-    ptfhost.shell("pkill -f influxd || true", module_ignore_errors=True)
+    # Stop any existing influxdb3 and clean stale data
+    ptfhost.shell("pkill -f influxdb3 || true", module_ignore_errors=True)
     time.sleep(2)
-    ptfhost.shell("rm -rf ~/.influxdbv2", module_ignore_errors=True)
+    ptfhost.shell("rm -rf ~/.influxdb3", module_ignore_errors=True)
 
     ptfhost.shell(
-        f"nohup influxd --http-bind-address=:{port} "
-        "> /tmp/influxd.log 2>&1 &",
+        f"nohup influxdb3 serve --object-store memory --node-id test "
+        f"--http-bind={port} --without-auth "
+        "> /var/log/influxdb3.log 2>&1 &",
         module_ignore_errors=False,
     )
 
-    # Wait for health endpoint to return "pass"
+    # Wait for health endpoint to return "OK"
     end_time = time.time() + timeout
     while time.time() < end_time:
         result = ptfhost.shell(
             f"curl -sf http://localhost:{port}/health",
             module_ignore_errors=True,
         )
-        if result["rc"] == 0 and "pass" in result.get("stdout", ""):
-            logger.info("InfluxDB is healthy")
+        if result["rc"] == 0 and "OK" in result.get("stdout", ""):
+            logger.info("InfluxDB 3 is healthy")
             return True
         time.sleep(2)
-    pytest_assert(False, f"InfluxDB did not become healthy within {timeout}s")
+    pytest_assert(False, f"InfluxDB 3 did not become healthy within {timeout}s")
 
 
-def setup_influxdb(ptfhost, port=8086, org="docs", bucket="home",
-                   token="mytoken123456789", username="admin",
-                   password="password123"):
+def setup_influxdb(ptfhost, port=8181, bucket="home"):
     """
-    Initialize InfluxDB 2.x via the onboarding setup API.
-    Idempotent: skips if already set up.
+    Ensure the InfluxDB 3 database exists.
+
+    InfluxDB 3 Core is schema-on-write and auto-creates databases on first
+    write, so explicit creation is optional. We attempt to pre-create the
+    database via the CLI for clarity; failure is non-fatal.
     """
-    import json
-
-    setup_payload = json.dumps({
-        "username": username,
-        "password": password,
-        "org": org,
-        "bucket": bucket,
-        "token": token,
-    })
-
     result = ptfhost.shell(
-        f"curl -sf -X POST http://localhost:{port}/api/v2/setup "
-        f"-H 'Content-Type: application/json' "
-        f"--data '{setup_payload}'",
+        f"influxdb3 create database {bucket} --port {port}",
         module_ignore_errors=True,
     )
-    if result["rc"] != 0:
-        # Check if already set up (allowed=false means setup was done before)
-        check = ptfhost.shell(
-            f"curl -sf http://localhost:{port}/api/v2/setup",
-            module_ignore_errors=True,
+    if result["rc"] == 0:
+        logger.info(f"InfluxDB 3 database '{bucket}' created")
+    else:
+        logger.info(
+            f"InfluxDB 3 database '{bucket}' may already exist or will "
+            "auto-create on first write (rc=%d)", result["rc"],
         )
-        if '"allowed":false' in check.get("stdout", ""):
-            logger.info("InfluxDB already set up, skipping")
-            return
-        pytest_assert(
-            False,
-            f"InfluxDB setup failed: {result.get('stderr', '')}",
-        )
-    logger.info(f"InfluxDB setup complete (org={org}, bucket={bucket})")
 
 
-def query_influxdb(ptfhost, flux_query, port=8086, org="docs",
-                   token="mytoken123456789"):
+def query_influxdb(ptfhost, influxql_query, port=8181, db="home"):
     """
-    Execute a Flux query against InfluxDB via the HTTP API.
+    Execute an InfluxQL query against InfluxDB 3 via the v1 /query endpoint.
 
     Returns:
-        dict: shell result with 'rc', 'stdout', 'stderr'
+        dict: shell result with 'rc', 'stdout', 'stderr'.
+              stdout contains JSON in the v1 response format.
     """
     cmd = (
-        f"curl -sS -X POST 'http://localhost:{port}/api/v2/query?org={org}' "
-        f"-H 'Authorization: Token {token}' "
-        f"-H 'Content-Type: application/vnd.flux' "
-        f"-H 'Accept: application/csv' "
-        f"--data-binary '{flux_query}'"
+        f"curl -sS -G 'http://localhost:{port}/query' "
+        f"--data-urlencode 'db={db}' "
+        f"--data-urlencode 'q={influxql_query}'"
     )
     return ptfhost.shell(cmd, module_ignore_errors=True)
 
 
-def wait_for_influxdb_data(ptfhost, bucket="home", org="docs",
-                           token="mytoken123456789", port=8086,
+def wait_for_influxdb_data(ptfhost, bucket="home", port=8181,
                            timeout=60, poll_interval=5):
     """
-    Poll InfluxDB until at least one data point appears in the bucket.
+    Poll InfluxDB 3 until at least one data point appears in the database.
 
     Returns:
         dict or None: the query result if data is found, None on timeout
     """
-    flux_query = f'from(bucket:"{bucket}") |> range(start:-10m) |> limit(n:5)'
+    import json as _json
+
+    influxql = "SELECT * FROM /.*/ LIMIT 5"
 
     end_time = time.time() + timeout
     last_result = None
     while time.time() < end_time:
         last_result = query_influxdb(
-            ptfhost, flux_query, port=port, org=org, token=token,
+            ptfhost, influxql, port=port, db=bucket,
         )
         stdout = last_result.get("stdout", "").strip()
         if last_result["rc"] == 0 and stdout:
-            # InfluxDB CSV: lines starting with '#' are annotations,
-            # the first non-annotation line is the header, subsequent
-            # non-empty lines are data rows.
-            data_lines = [
-                line for line in stdout.split("\n")
-                if line.strip()
-                and not line.startswith("#")
-                and not line.startswith(",result,")
-            ]
-            if data_lines:
-                logger.info(
-                    f"InfluxDB returned {len(data_lines)} data row(s)"
-                )
-                return last_result
+            try:
+                body = _json.loads(stdout)
+                results = body.get("results", [])
+                for r in results:
+                    series = r.get("series", [])
+                    if series:
+                        total_values = sum(
+                            len(s.get("values", [])) for s in series
+                        )
+                        logger.info(
+                            f"InfluxDB returned {total_values} data row(s)"
+                        )
+                        return last_result
+            except _json.JSONDecodeError:
+                pass
         time.sleep(poll_interval)
 
     logger.warning(
@@ -1723,67 +1706,58 @@ def wait_for_influxdb_data(ptfhost, bucket="home", org="docs",
 
 def stop_influxdb(ptfhost):
     """
-    Stop influxd on the PTF host and clean up data.
+    Stop InfluxDB 3 on the PTF host and clean up data.
     """
-    ptfhost.shell("pkill -f influxd || true", module_ignore_errors=True)
+    ptfhost.shell("pkill -f influxdb3 || true", module_ignore_errors=True)
     time.sleep(2)
-    ptfhost.shell("rm -rf ~/.influxdbv2", module_ignore_errors=True)
-    logger.info("InfluxDB stopped and data cleaned on PTF host")
+    ptfhost.shell("rm -rf ~/.influxdb3", module_ignore_errors=True)
+    logger.info("InfluxDB 3 stopped and data cleaned on PTF host")
 
 
-def parse_influxdb_csv(csv_text):
+def parse_influxdb_json(json_text):
     """
-    Parse InfluxDB annotated CSV into a list of dicts grouped by series.
+    Parse InfluxDB v1 API JSON response into groups of data rows.
 
-    InfluxDB CSV has annotation lines starting with '#', a header line,
-    and data rows. The 'table' column identifies the series group.
+    The v1 /query endpoint returns JSON like:
+      {"results":[{"statement_id":0,"series":[
+        {"name":"measurement","columns":["time","field1"],
+         "values":[[...],[...]]}
+      ]}]}
 
     Returns:
-        dict: mapping of series_key -> list of data-row dicts.
-              series_key is built from _measurement + _field + tag columns.
+        dict: mapping of series_name -> list of dicts (column->value).
     """
-    import csv
-    import io
+    import json as _json
 
-    lines = [
-        line for line in csv_text.strip().split("\n")
-        if line.strip() and not line.startswith("#")
-    ]
-    if not lines:
-        return {}
-
-    reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    body = _json.loads(json_text)
     groups = {}
-    for row in reader:
-        # Build a series key from measurement, field, and any tag-like columns
-        measurement = row.get("_measurement", "")
-        field = row.get("_field", "")
-        # Use table column as the primary grouping key
-        table = row.get("table", "0")
-        series_key = f"{measurement}/{field}/table={table}"
-        groups.setdefault(series_key, []).append(row)
+    for result in body.get("results", []):
+        for series in result.get("series", []):
+            name = series.get("name", "unknown")
+            columns = series.get("columns", [])
+            rows = []
+            for values in series.get("values", []):
+                rows.append(dict(zip(columns, values)))
+            groups.setdefault(name, []).extend(rows)
     return groups
 
 
-def validate_influxdb_intervals(ptfhost, bucket="home", org="docs",
-                                token="mytoken123456789", port=8086,
+def validate_influxdb_intervals(ptfhost, bucket="home", port=8181,
                                 expected_interval_ms=10,
                                 tolerance_low=0.5, tolerance_high=1.5,
                                 avg_tolerance=0.2, min_points=10):
     """
     Validate that HFT data points in InfluxDB arrive at the expected interval.
 
-    Queries all data from the last 5 minutes, groups by series, and for each
-    group checks that:
+    Queries all data from the last 5 minutes using InfluxQL, groups by series,
+    and for each group checks that:
       1. Consecutive timestamp deltas fall within
          [expected_ms * tolerance_low, expected_ms * tolerance_high]
       2. The average delta is within avg_tolerance of expected_ms
 
     Args:
         ptfhost: PTF host object
-        bucket: InfluxDB bucket name
-        org: InfluxDB org name
-        token: InfluxDB auth token
+        bucket: InfluxDB database name
         port: InfluxDB HTTP port
         expected_interval_ms: expected interval between points in ms
         tolerance_low: lower multiplier (0.5 = 50% of expected)
@@ -1799,20 +1773,17 @@ def validate_influxdb_intervals(ptfhost, bucket="home", org="docs",
     """
     from datetime import datetime
 
-    flux_query = (
-        f'from(bucket:"{bucket}") '
-        f'|> range(start:-5m) '
-        f'|> filter(fn: (r) => r._field == "IF_IN_OCTETS") '
-        f'|> group(columns: ["_measurement", "_field", "object_id"]) '
-        f'|> sort(columns: ["_time"])'
+    influxql = (
+        "SELECT * FROM /.*/ "
+        "WHERE time >= now() - 5m "
+        "ORDER BY time ASC"
     )
-    result = query_influxdb(ptfhost, flux_query, port=port, org=org,
-                            token=token)
+    result = query_influxdb(ptfhost, influxql, port=port, db=bucket)
     if result["rc"] != 0 or not result.get("stdout", "").strip():
         return {"groups": {}, "violations": ["No data returned from query"],
                 "passed": False}
 
-    groups = parse_influxdb_csv(result["stdout"])
+    groups = parse_influxdb_json(result["stdout"])
     all_stats = {}
     violations = []
 
@@ -1822,13 +1793,12 @@ def validate_influxdb_intervals(ptfhost, bucket="home", org="docs",
     for series_key, rows in groups.items():
         timestamps = []
         for row in rows:
-            time_str = row.get("_time", "")
+            time_str = row.get("time", "")
             if not time_str:
                 continue
             try:
-                # InfluxDB returns RFC3339 with nanoseconds, e.g.
+                # InfluxDB 3 returns RFC3339 timestamps, e.g.
                 # 2026-04-10T06:32:03.117415123Z
-                # Python's fromisoformat handles up to microseconds
                 clean = time_str.replace("Z", "+00:00")
                 # Truncate to microseconds if nanoseconds present
                 if "." in clean:

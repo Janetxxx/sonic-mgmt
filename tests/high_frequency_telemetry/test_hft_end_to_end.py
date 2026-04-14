@@ -28,10 +28,8 @@ pytestmark = [
 ]
 
 # InfluxDB constants shared between otel collector config and query helpers
-INFLUXDB_PORT = 8086
-INFLUXDB_ORG = "docs"
+INFLUXDB_PORT = 8181
 INFLUXDB_BUCKET = "home"
-INFLUXDB_TOKEN = "mytoken123456789"
 
 
 def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
@@ -40,7 +38,7 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
     End-to-end test for High Frequency Telemetry.
 
     Flow:
-      1. Start InfluxDB on PTF and initialise org / bucket / token
+      1. Start InfluxDB 3 on PTF and create the database
       2. Enable the otel container on the DUT
       3. Install the otel-collector config that exports to PTF's InfluxDB
       4. Configure an HFT profile + port group
@@ -58,9 +56,7 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
         setup_influxdb(
             ptfhost,
             port=INFLUXDB_PORT,
-            org=INFLUXDB_ORG,
             bucket=INFLUXDB_BUCKET,
-            token=INFLUXDB_TOKEN,
         )
 
         # --- Step 2: Enable the otel feature (creates the container) ---
@@ -73,9 +69,7 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
         rendered_config = render_otel_collector_config(
             template_path,
             ptf_ip=tbinfo["ptf_ip"],
-            influxdb_org=INFLUXDB_ORG,
             influxdb_bucket=INFLUXDB_BUCKET,
-            influxdb_token=INFLUXDB_TOKEN,
         )
         install_otel_collector_config(duthost, rendered_config)
         duthost.shell("docker restart otel", module_ignore_errors=False)
@@ -110,8 +104,6 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
         result = wait_for_influxdb_data(
             ptfhost,
             bucket=INFLUXDB_BUCKET,
-            org=INFLUXDB_ORG,
-            token=INFLUXDB_TOKEN,
             port=INFLUXDB_PORT,
             timeout=60,
         )
@@ -131,8 +123,6 @@ def test_hft_end_to_end_influxdb(duthosts, enum_rand_one_per_hwsku_hostname,
         interval_result = validate_influxdb_intervals(
             ptfhost,
             bucket=INFLUXDB_BUCKET,
-            org=INFLUXDB_ORG,
-            token=INFLUXDB_TOKEN,
             port=INFLUXDB_PORT,
             expected_interval_ms=10,
             tolerance_low=0.5,
