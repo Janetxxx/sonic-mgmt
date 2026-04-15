@@ -369,6 +369,8 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 
 ### End-to-End Tests
 
+> **Planned** — implementation pending [PR #21982](https://github.com/sonic-net/sonic-mgmt/pull/21982). Details below may change before the implementation is merged.
+
 #### Test Case: Test HFT End-to-End InfluxDB
 
 | Item | Description |
