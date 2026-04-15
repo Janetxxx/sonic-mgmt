@@ -382,16 +382,16 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 | **Objective** | Validate the full HFT telemetry pipeline end-to-end: `countersyncd` → OpenTelemetry collector → InfluxDB. Confirms that HFT metrics actually flow through the otel collector and arrive in an external time-series database. |
 | **Fixtures** | `disable_flex_counters`, `tbinfo`, `ptfhost` |
 | **Topology** | `any` |
-| **Dependencies** | Requires `influxd` binary installed in PTF container ([sonic-buildimage PR #26146](https://github.com/sonic-net/sonic-buildimage/pull/26146)). Requires `otel` container support on DUT. |
+| **Dependencies** | Requires InfluxDB 3 Core (`influxdb3`) installed in PTF container ([sonic-buildimage PR #26755](https://github.com/sonic-net/sonic-buildimage/pull/26755)). Requires `otel` container support on DUT. |
 
 **Test Steps**
-1. **Start InfluxDB on PTF host**: Kill any existing `influxd`, clean stale data (`~/.influxdbv2`), start `influxd` on port 8086, and wait for the `/health` endpoint to return `pass` (30s timeout).
-2. **Initialize InfluxDB**: Call the `/api/v2/setup` onboarding API to create org (`docs`), bucket (`home`), and token (`mytoken123456789`). Idempotent — skips if already set up.
+1. **Start InfluxDB 3 on PTF host**: Kill any existing `influxdb3`, clean stale data, start `influxdb3 serve --object-store memory --node-id test --without-auth` on port 8181, and wait for the `/health` endpoint to return `OK` (30s timeout).
+2. **Initialize InfluxDB 3**: Create database `home` via `influxdb3 create database` CLI. InfluxDB 3 Core is schema-on-write so the database will also auto-create on first write.
 3. **Enable otel collector on DUT**: Run `config feature state otel enabled` and wait up to 60 seconds for the `otel` container to be running.
 4. **Install otel collector config**: Render the Jinja2 template (`otel_collector_influxdb.yaml.j2`) with PTF IP, InfluxDB org/bucket/token, and copy to `/etc/sonic/otel_config.yml` on the DUT. Restart the `otel` container.
 5. **Configure HFT**: Get available ports (desired: 2, minimum: 1). Create HFT profile (`port_profile`, poll interval 10ms, stream `enabled`) and PORT group monitoring `IF_IN_OCTETS`.
 6. **Start countersyncd with otel export**: Run `countersyncd --enable-otel -e` in background inside `swss` container.
-7. **Poll InfluxDB for metrics**: Execute Flux query `from(bucket:"home") |> range(start:-10m) |> limit(n:5)` every 5 seconds for up to 60 seconds. Parse CSV response — skip annotation lines (starting with `#`) and header lines.
+7. **Poll InfluxDB for metrics**: Execute InfluxQL query `SELECT * FROM /.*/ LIMIT 5` via the `/query` endpoint every 5 seconds for up to 60 seconds. Parse JSON response in v1 format.
 8. **Verify data arrived**: Assert that at least one data row is returned from InfluxDB.
 9. **Cleanup**: Remove HFT config, stop `countersyncd` otel process, stop `influxd` and clean data on PTF host.
 
@@ -399,12 +399,12 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 ```
 Receivers:  otlp (gRPC :4317, HTTP :4318)
 Processors: batch (timeout 1s, batch size 10)
-Exporters:  influxdb (PTF host :8086) + debug (verbose)
+Exporters:  influxdb (PTF host :8181) + debug (verbose)
 Pipeline:   metrics → [otlp] → [batch] → [debug, influxdb]
 ```
 
 **Expected Results**
-- InfluxDB health endpoint returns `pass` after startup.
+- InfluxDB 3 health endpoint returns `OK` (HTTP 200) after startup.
 - Otel container starts successfully on DUT.
 - InfluxDB query returns ≥ 1 data row within 60 seconds, confirming metrics flowed through the full pipeline.
 
