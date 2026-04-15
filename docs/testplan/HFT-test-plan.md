@@ -64,6 +64,8 @@ HFT Phase 1 supports key AI data center statistics across four object types:
 | **INGRESS_PRIORITY_GROUP** | `SAI_INGRESS_PRIORITY_GROUP_STAT_PACKETS`, `SAI_INGRESS_PRIORITY_GROUP_STAT_BYTES`, `SAI_INGRESS_PRIORITY_GROUP_STAT_CURR_OCCUPANCY_BYTES`, `SAI_INGRESS_PRIORITY_GROUP_STAT_WATERMARK_BYTES`, `SAI_INGRESS_PRIORITY_GROUP_STAT_XOFF_ROOM_CURR_OCCUPANCY_BYTES`, `SAI_INGRESS_PRIORITY_GROUP_STAT_XOFF_ROOM_WATERMARK_BYTES`, `SAI_INGRESS_PRIORITY_GROUP_STAT_DROPPED_PACKETS` |
 
 > **Note**: Not all counters are supported on all platforms. The `counter_profiles.py` module provides per-platform counter definitions. Tests dynamically query supported counters and skip when none are available.
+>
+> `SAI_PORT_STAT_TRIM_PACKETS` and `SAI_QUEUE_STAT_TRIM_PACKETS` have limited platform availability and are not currently enabled in `counter_profiles.py` for any tested platform.
 
 ---
 
