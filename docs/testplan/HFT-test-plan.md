@@ -141,6 +141,7 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 
 **Expected Results**
 - Counter values ≥ 0 are reported for queue objects.
+- Msg/s rate is validated against the configured poll_interval (10000µs) via `validate_counter_output`.
 
 ---
 
@@ -164,6 +165,7 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 
 **Expected Results**
 - Counter values ≥ 0 are reported for ingress priority group objects.
+- Msg/s rate is validated against the configured poll_interval (10000µs) via `validate_counter_output`.
 
 ---
 
@@ -187,6 +189,7 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 
 **Expected Results**
 - Counter values ≥ 0 are reported for buffer pool objects.
+- Msg/s rate is validated against the configured poll_interval (10000µs) via `validate_counter_output`.
 
 ---
 
@@ -210,6 +213,7 @@ Per-platform supported counters are defined in `tests/high_frequency_telemetry/c
 
 **Expected Results**
 - All configured counter groups produce valid output under a single profile.
+- Msg/s rate is validated against the configured poll_interval (10000µs) via `validate_counter_output`.
 
 ---
 
